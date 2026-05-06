@@ -46,108 +46,126 @@ notifications table:
 
 ## Stage 1
 
-We need these API endpoints so the frontend can show notifications to students:
+REST API endpoints for the notification platform:
 
-- GET /notifications → fetch all notifications for a student
-- GET /notifications/:id → fetch one specific notification
-- POST /notifications → create a new notification
-- PATCH /notifications/:id/read → mark a notification as read
-- DELETE /notifications/:id → delete a notification
-- GET /notifications/unread → get only unread notifications
+GET /notifications
+Headers: { "Authorization": "Bearer <token>", "Content-Type": "application/json" }
+Response: { "notifications": [{ "id": "uuid", "studentId": "uuid", "type": "Placement/Event/Result", "message": "string", "isRead": false, "createdAt": "timestamp" }] }
 
-Each notification looks like this:
-{
-  "id": "unique-id",
-  "studentId": "student-unique-id",
-  "type": "Placement / Event / Result",
-  "message": "You have a new placement opportunity",
-  "isRead": false,
-  "createdAt": "2026-05-06 10:00:00"
-}
+GET /notifications/:id
+Headers: { "Authorization": "Bearer <token>", "Content-Type": "application/json" }
+Response: { "id": "uuid", "studentId": "uuid", "type": "Placement", "message": "string", "isRead": false, "createdAt": "timestamp" }
 
-For real-time notifications we use WebSockets,
-so students get notified instantly without refreshing the page.
+POST /notifications
+Headers: { "Authorization": "Bearer <token>", "Content-Type": "application/json" }
+Request: { "studentId": "uuid", "type": "Placement/Event/Result", "message": "string" }
+Response: { "id": "uuid", "message": "Notification created", "createdAt": "timestamp" }
 
----
+PATCH /notifications/:id/read
+Headers: { "Authorization": "Bearer <token>" }
+Response: { "message": "Notification marked as read" }
+
+DELETE /notifications/:id
+Headers: { "Authorization": "Bearer <token>" }
+Response: { "message": "Notification deleted" }
+
+GET /notifications/unread
+Headers: { "Authorization": "Bearer <token>" }
+Response: { "notifications": [...], "count": 5 }
+
+Real-time: We use WebSockets so students get notified instantly without refreshing.
 
 ## Stage 2
 
-We use PostgreSQL as our database because it is reliable,
-handles lots of data well, and supports complex queries easily.
+We use PostgreSQL because it handles large data well and supports complex queries.
 
-Tables we need:
+CREATE TABLE students (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL,
+  email VARCHAR(100) UNIQUE NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
 
-students table → stores student info (id, name, email)
-notifications table → stores all notifications (id, studentId, type, message, isRead, createdAt)
+CREATE TABLE notifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  studentID UUID REFERENCES students(id),
+  notificationType VARCHAR(20) CHECK (notificationType IN ('Placement','Event','Result')),
+  message TEXT NOT NULL,
+  isRead BOOLEAN DEFAULT false,
+  createdAt TIMESTAMP DEFAULT NOW()
+);
 
-As data grows, queries will get slower. We fix this by adding
-indexes on studentId and createdAt so the database finds
-data faster without scanning every single row.
+As data grows queries slow down. We fix this with indexes, pagination and archiving old data.
 
----
+SELECT * FROM notifications WHERE studentID = 'uuid' ORDER BY createdAt DESC;
+SELECT * FROM notifications WHERE studentID = 'uuid' AND isRead = false ORDER BY createdAt DESC;
 
 ## Stage 3
 
-The slow query is:
-SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt DESC;
+The query is slow because it scans all 5 million rows and SELECT * fetches unnecessary columns.
 
-Why is it slow? Because the database is checking all 5 million rows one by one.
-SELECT * also fetches columns we don't even need.
-
-Fix → add an index and select only needed columns:
+Fix:
 CREATE INDEX idx_notifications ON notifications(studentID, isRead, createdAt DESC);
-SELECT id, message, notificationType, createdAt FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt DESC;
+SELECT id, message, notificationType, createdAt FROM notifications
+WHERE studentID = 1042 AND isRead = false ORDER BY createdAt DESC;
 
-Should we add indexes on every column? No.
-Each index makes inserts and updates slower and wastes storage.
-Only add indexes on columns you actually search by.
+Adding indexes on every column is bad — it slows down inserts and wastes storage.
+Only index columns you actually search by.
 
-Students who got Placement notifications in last 7 days:
-SELECT DISTINCT studentID FROM notifications WHERE notificationType = 'Placement' AND createdAt >= NOW() - INTERVAL '7 days';
-
----
+Students with Placement notifications in last 7 days:
+SELECT DISTINCT studentID FROM notifications
+WHERE notificationType = 'Placement'
+AND createdAt >= NOW() - INTERVAL '7 days';
 
 ## Stage 4
 
-Problem → the database is being hit every single time any student opens the app. With 50,000 students this kills the database.
+Problem: DB is hit on every page load for every student which overwhelms it.
 
-Solution → use Redis as a cache. Think of Redis like a super fast notepad.
-When a student opens the app, we check the notepad first.
-If the answer is there, we return it instantly without touching the database.
-If not, we fetch from database, write it to the notepad, and return it.
-The notepad clears itself every 5 minutes so data stays fresh.
+Solution 1 - Redis Cache: Check cache first, fetch DB only on miss, cache expires in 5 mins.
+Tradeoff: data can be slightly stale.
 
-We also add pagination so we never load all notifications at once,
-only 20 at a time.
+Solution 2 - Pagination: Load only 20 notifications at a time.
+Tradeoff: multiple requests needed.
 
----
+Solution 3 - WebSocket Push: Push notifications instead of fetching on load.
+Tradeoff: complex to implement.
+
+Best approach: Redis caching + pagination together.
 
 ## Stage 5
 
-Problem with current code → it sends emails to 50,000 students
-one by one in a loop. If it fails at student 200, the remaining
-49,800 students never get notified and we don't even know who was missed.
+Problems with current code: sequential loop is slow for 50,000 students,
+no retry if email fails, no logging of failures, email and DB happen together.
 
-Better approach:
-- Save to database first, then send email. This way even if email fails, we have a record.
-- Split 50,000 students into small batches of 500 and process them together.
-- If any student fails, add them to a retry list and try again later.
-- Log every failure so we always know exactly who didn't get the notification.
+When send_email failed for 200 students, those students never got notified
+and there is no record of who failed.
 
----
+Better pseudocode:
+
+function notify_all(student_ids, message):
+  batches = split(student_ids, 500)
+  for batch in batches:
+    parallel_for student_id in batch:
+      try:
+        save_to_db(student_id, message)
+        send_email(student_id, message)
+        push_to_app(student_id, message)
+      catch error:
+        add_to_retry_queue(student_id)
+        log_error(student_id, error)
+  process_retry_queue()
+
+Save to DB first always so even if email fails we have a record and can retry.
 
 ## Stage 6
 
-Priority Inbox shows the top 10 most important unread notifications first.
+Priority Inbox shows top n notifications where n is chosen by user: 10, 15, 20 etc.
 
-Priority is decided by:
-- Placement notifications → highest priority
-- Result notifications → medium priority  
-- Event notifications → lowest priority
-- Among same type, newer ones come first
+Priority weights: Placement = 3, Result = 2, Event = 1.
+Among same type, newer timestamp wins.
 
-We use a Min-Heap of size 10 to keep this efficient.
-As new notifications come in, we compare and swap so the
-top 10 list always stays updated without re-sorting everything.
+We use a Min-Heap of size n. When a new notification arrives,
+if it beats the lowest priority in the heap, it replaces it.
+This gives O(log n) per insert instead of re-sorting everything.
 
-See priority_inbox.go in notification_app_be folder for the code.
+See notification_app_be/main.go for working code.
